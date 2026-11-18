@@ -1,0 +1,50 @@
+name: weekly
+on:
+  schedule:
+    - cron: "53 22 * * 0"   # 매주 월요일 07:53 KST
+  workflow_dispatch:
+
+concurrency:
+  group: eclass-state
+  cancel-in-progress: false
+
+permissions:
+  actions: write   # keepalive용
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: state-
+      - name: weekly summary
+        env:
+          ECLASS_ID: ${{ secrets.ECLASS_ID }}
+          ECLASS_PW: ${{ secrets.ECLASS_PW }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python main.py weekly
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
+      # 공개 레포는 60일간 활동이 없으면 예약 실행이 꺼진다 → 매주 다시 켜서 방지
+      - name: keepalive
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow enable check.yml -R ${{ github.repository }} || true
+          gh workflow enable weekly.yml -R ${{ github.repository }} || true

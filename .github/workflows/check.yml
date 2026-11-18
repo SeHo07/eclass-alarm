@@ -1,0 +1,43 @@
+name: check
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # 10분마다
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "check / weekly / test"
+        default: test
+        required: true
+
+concurrency:
+  group: eclass-state      # 상태 파일 충돌 방지 (weekly와 공유)
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: state-
+      - name: run
+        env:
+          ECLASS_ID: ${{ secrets.ECLASS_ID }}
+          ECLASS_PW: ${{ secrets.ECLASS_PW }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python main.py ${{ github.event.inputs.mode || 'check' }}
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
