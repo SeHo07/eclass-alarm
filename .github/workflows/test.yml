@@ -1,0 +1,43 @@
+name: test
+# run-test 브랜치에 푸시하면 연결 테스트 실행 (로그인 + 텔레그램 발송)
+on:
+  push:
+    branches: [run-test]
+  workflow_dispatch:
+
+concurrency:
+  group: eclass-state
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt pytest
+      - run: python -m pytest -q
+      - uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: state-
+      - name: connectivity
+        run: |
+          curl -sS -o /dev/null -w "eclass HTTP %{http_code}\n" --max-time 20 https://eclass.dongguk.edu/login/index.php || echo "eclass 접속 실패"
+      - name: test run
+        env:
+          ECLASS_ID: ${{ secrets.ECLASS_ID }}
+          ECLASS_PW: ${{ secrets.ECLASS_PW }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: python main.py test
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state
+          key: state-${{ github.run_id }}-${{ github.run_attempt }}
