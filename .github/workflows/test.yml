@@ -28,14 +28,19 @@ jobs:
           restore-keys: state-
       - name: connectivity
         run: |
-          curl -sS -o /dev/null -w "eclass HTTP %{http_code}\n" --max-time 20 https://eclass.dongguk.edu/login/index.php || echo "eclass 접속 실패"
+          code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 20 https://eclass.dongguk.edu/login/index.php || echo "FAIL")
+          echo "::notice title=eclass::HTTP $code"
+          tg=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 20 https://api.telegram.org/ || echo "FAIL")
+          echo "::notice title=telegram::HTTP $tg"
       - name: test run
         env:
           ECLASS_ID: ${{ secrets.ECLASS_ID }}
           ECLASS_PW: ${{ secrets.ECLASS_PW }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python main.py test
+        run: |
+          set -o pipefail
+          python main.py test 2>&1 | tee out.log || { echo "::error title=test failed::$(tail -c 1500 out.log | tr '\n' ' ')"; exit 1; }
       - uses: actions/cache/save@v4
         if: always()
         with:
