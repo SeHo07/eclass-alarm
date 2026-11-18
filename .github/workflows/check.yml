@@ -1,7 +1,7 @@
 name: check
 on:
   schedule:
-    - cron: "*/10 * * * *"   # 10분마다
+    - cron: "4,14,24,34,44,54 * * * *"   # 10분마다 (정각 혼잡 회피)
   workflow_dispatch:
     inputs:
       mode:
