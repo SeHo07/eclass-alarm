@@ -130,3 +130,24 @@ def test_list_text():
     now = 1_800_000_000
     txt = main.list_text([_item("a", 3600, now=now), _item("b", 7200, done=True, now=now)], now)
     assert "⬜" in txt and "✅" in txt and "미완료 1개 / 전체 2개" in txt
+
+
+def test_pause_and_resume():
+    now = 1_800_000_000
+    assert main.parse_pause("/pause", now) == float("inf")
+    assert main.parse_pause("/pause 3h", now) == now + 3 * 3600
+    assert main.parse_pause("/pause 2d", now) == now + 2 * 86400
+    assert main.parse_pause("일시정지 5", now) == now + 5 * 3600
+    state = {}
+    tg = FakeTG([{"update_id": 1, "message": {"chat": {"id": 1}, "text": "/pause 2h"}}])
+    main.handle_updates(tg, state, [], {})
+    assert state["paused_until"] > 0
+    assert main.is_paused({"paused_until": now + 10}, now)
+    st = {"paused_until": now - 1}
+    assert not main.is_paused(st, now) and "paused_until" not in st
+    tg.ups = [{"update_id": 2, "message": {"chat": {"id": 1}, "text": "/resume"}}]
+    main.handle_updates(tg, state, [], {})
+    assert "paused_until" not in state
+    # 무기한 정지도 JSON 저장/복원 가능
+    import json
+    assert json.loads(json.dumps({"p": float("inf")}))["p"] == float("inf")

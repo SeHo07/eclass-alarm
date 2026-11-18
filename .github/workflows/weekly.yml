@@ -46,5 +46,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh workflow enable check.yml -R ${{ github.repository }} || true
-          gh workflow enable weekly.yml -R ${{ github.repository }} || true
+          # 직접 Disable한 워크플로(disabled_manually)는 다시 켜지 않는다
+          for wf in check.yml weekly.yml; do
+            st=$(gh api repos/${{ github.repository }}/actions/workflows/$wf --jq .state || echo unknown)
+            echo "$wf: $st"
+            if [ "$st" = "active" ] || [ "$st" = "disabled_inactivity" ]; then
+              gh workflow enable $wf -R ${{ github.repository }} || true
+            fi
+          done

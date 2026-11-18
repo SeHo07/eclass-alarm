@@ -10,6 +10,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta
@@ -129,6 +130,16 @@ def handle_updates(tg: Telegram, state: dict, items: list[Item] | None, pending:
                 tg.edit(p["msg"], "✅ 확인함 — " + esc(p["item"].name))
                 pending.pop(key)
             tg.send("✅ 지금 울리는 알림 전부 확인 처리했어")
+        elif text.startswith(("/pause", "일시정지")):
+            until = parse_pause(text, now)
+            state["paused_until"] = until
+            when = "다시 켤 때까지(/resume)" if until == float("inf") else fmt_dt(int(until)) + "까지"
+            for key in list(pending):
+                tg.edit(pending.pop(key)["msg"], "⏸ 일시정지로 알림 중단")
+            tg.send(f"⏸ 마감 알림 일시정지: {when}\n주간 정리와 /list는 계속 동작해.")
+        elif text in ("/resume", "재개"):
+            state.pop("paused_until", None)
+            tg.send("▶️ 마감 알림 다시 켬")
         elif text in ("/list", "목록") and items is not None:
             tg.send(list_text(items, now, days=7, include_done=False, title="<b>📋 미완료 항목 (7일)</b>"))
         elif text in ("/week", "주간") and items is not None:
@@ -138,7 +149,28 @@ def handle_updates(tg: Telegram, state: dict, items: list[Item] | None, pending:
                     "• 마감 3시간·1시간 전에 [확인] 누를 때까지 반복 알림\n"
                     "• /list 미완료 목록 · /week 이번 주 일정\n"
                     "• '확인'이라고 보내면 울리는 알림 전부 정지\n"
+                    "• /pause 3h · /pause 2d · /pause (무기한) 일시정지, /resume 재개\n"
                     "(10분마다 확인해서 답장이 최대 10분 늦을 수 있어)")
+
+
+def parse_pause(text: str, now: float) -> float:
+    """'/pause' -> 무기한, '/pause 3h' / '3' -> 3시간, '/pause 2d' -> 2일"""
+    m = re.search(r"(\d+)\s*([hdm시일분]?)", text)
+    if not m:
+        return float("inf")
+    n, unit = int(m.group(1)), m.group(2)
+    sec = {"d": 86400, "일": 86400, "m": 60, "분": 60}.get(unit, 3600)
+    return now + n * sec
+
+
+def is_paused(state: dict, now: float) -> bool:
+    until = state.get("paused_until")
+    if until is None:
+        return False
+    if now >= until:
+        state.pop("paused_until", None)
+        return False
+    return True
 
 
 # ---------------------------------------------------------------- 모드
@@ -180,6 +212,9 @@ def run_check(tg: Telegram, state: dict) -> None:
     if items is None:
         return
     start = now = time.time()
+    if is_paused(state, now):
+        print("paused")
+        return
     for it, level, title in due_alerts(items, state.get("acked", {}), now):
         pending[f"{it.cmid}:{level}"] = {"item": it, "title": title, "msg": None, "count": 0, "last": 0}
     print(f"items={len(items)} pending_alerts={len(pending)}")
