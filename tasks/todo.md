@@ -8,6 +8,7 @@
 - [x] GitHub Actions (10분 cron, 상태는 actions cache, keepalive)
 - [x] 오프라인 단위 테스트 (pytest)
 - [ ] Secrets 등록 후 Actions에서 test 모드 실행 → 실제 로그인/발송 검증
+- [x] 로그인 최소화: 미완료 마감 3시간 이내일 때만 10분 간격, 평소엔 3시간마다 + 매번 로그아웃
 - [ ] 실제 알림 1회 관찰 후 간격 조정
 
 ## 리뷰

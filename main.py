@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import time
+from dataclasses import asdict
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -22,6 +23,8 @@ from eclass_alarm.telegram import Telegram
 STATE_PATH = Path(os.environ.get("STATE_PATH", "state/state.json"))
 WINDOWS = [(2, 60 * 60, "🚨🚨 마감 1시간 전"), (1, 3 * 60 * 60, "⏰ 마감 3시간 전")]  # (level, 초, 제목)
 LOOP_SECONDS = int(os.environ.get("LOOP_SECONDS", "480"))   # 한 번 실행에서 반복 알림을 유지하는 시간
+REFRESH_HOURS = float(os.environ.get("REFRESH_HOURS", "3"))  # 마감 없을 때 정기 확인 간격
+ALERT_MARGIN = 15 * 60  # 알림 구간 직전부터 미리 확인
 RESEND_SECONDS = int(os.environ.get("RESEND_SECONDS", "60"))  # 반복 간격
 WEEKDAYS = "월화수목금토일"
 ACK_WORDS = {"확인", "ㅇㅋ", "ok", "OK", "/ack"}
@@ -140,8 +143,15 @@ def handle_updates(tg: Telegram, state: dict, items: list[Item] | None, pending:
         elif text in ("/resume", "재개"):
             state.pop("paused_until", None)
             tg.send("▶️ 마감 알림 다시 켬")
+        elif text in ("/refresh", "새로고침"):
+            state["force_refresh"] = True
+            if items is None:
+                tg.send("🔄 지금 이클래스 확인할게")
         elif text in ("/list", "목록") and items is not None:
-            tg.send(list_text(items, now, days=7, include_done=False, title="<b>📋 미완료 항목 (7일)</b>"))
+            seen = state.get("fetched_at")
+            note = f" · {datetime.fromtimestamp(seen, KST):%m/%d %H:%M} 기준" if seen else ""
+            tg.send(list_text(items, now, days=7, include_done=False, title=f"<b>📋 미완료 항목 (7일){note}</b>")
+                    + "\n최신 상태가 필요하면 /refresh")
         elif text in ("/week", "주간") and items is not None:
             tg.send(list_text(items, now, days=7))
         elif text in ("/start", "/help"):
@@ -149,6 +159,7 @@ def handle_updates(tg: Telegram, state: dict, items: list[Item] | None, pending:
                     "• 마감 3시간·1시간 전에 [확인] 누를 때까지 반복 알림\n"
                     "• /list 미완료 목록 · /week 이번 주 일정\n"
                     "• '확인'이라고 보내면 울리는 알림 전부 정지\n"
+                    "• /refresh 지금 바로 이클래스 다시 확인\n"
                     "• /pause 3h · /pause 2d · /pause (무기한) 일시정지, /resume 재개\n"
                     "(10분마다 확인해서 답장이 최대 10분 늦을 수 있어)")
 
@@ -176,10 +187,13 @@ def is_paused(state: dict, now: float) -> bool:
 # ---------------------------------------------------------------- 모드
 
 def collect(state: dict, tg: Telegram) -> list[Item] | None:
+    cli = None
     try:
         cli = EclassClient(os.environ["ECLASS_ID"], os.environ["ECLASS_PW"])
         items = cli.collect()
-        state.pop("error_since", None)
+        state["items"] = [asdict(i) for i in items]
+        state["fetched_at"] = time.time()
+        state.pop("force_refresh", None)
         return items
     except Exception as e:  # 로그인 실패 등은 6시간에 한 번만 알림
         print(f"collect error: {type(e).__name__}: {e}", file=sys.stderr)
@@ -189,6 +203,30 @@ def collect(state: dict, tg: Telegram) -> list[Item] | None:
             tg.send(f"⚠️ 이클래스 {kind}: {esc(str(e))[:300]}\n이 상태면 알림이 안 가니까 확인해줘.")
             state["last_error_notice"] = time.time()
         return None
+    finally:
+        if cli:
+            cli.logout()  # 세션을 남겨두지 않는다
+
+
+def cached_items(state: dict) -> list[Item] | None:
+    if "items" not in state:
+        return None
+    return [Item(**d) for d in state["items"]]
+
+
+def need_refresh(state: dict, now: float) -> str | None:
+    """로그인이 필요한 이유를 반환. None이면 이번 실행은 로그인하지 않는다."""
+    if state.get("force_refresh"):
+        return "요청"
+    items = cached_items(state)
+    if items is None:
+        return "캐시 없음"
+    if now - state.get("fetched_at", 0) >= REFRESH_HOURS * 3600:
+        return "정기 확인"
+    for it in items:  # 미완료 항목이 알림 구간(3시간 + 여유) 안에 있을 때만 10분 간격 확인
+        if not it.done and 0 < it.deadline - now <= WINDOWS[-1][1] + ALERT_MARGIN:
+            return "마감 임박"
+    return None
 
 
 def due_alerts(items: list[Item], acked: dict, now: float) -> list[tuple[Item, int, str]]:
@@ -207,13 +245,23 @@ def due_alerts(items: list[Item], acked: dict, now: float) -> list[tuple[Item, i
 
 def run_check(tg: Telegram, state: dict) -> None:
     pending: dict[str, dict] = {}
+    handle_updates(tg, state, cached_items(state), pending)  # 명령어는 로그인 없이 캐시로 응답
+    start = now = time.time()
+    if is_paused(state, now) and not state.get("force_refresh"):
+        print("paused")
+        return
+    reason = need_refresh(state, now)
+    if reason is None:
+        print("skip: 마감 임박 항목 없음, 로그인 안 함")
+        return
+    print(f"refresh: {reason}")
+    was_forced = state.get("force_refresh")
     items = collect(state, tg)
-    handle_updates(tg, state, items, pending)
     if items is None:
         return
-    start = now = time.time()
+    if was_forced:
+        tg.send(list_text(items, now, days=7, include_done=False, title="<b>🔄 새로 확인함 · 미완료 (7일)</b>"))
     if is_paused(state, now):
-        print("paused")
         return
     for it, level, title in due_alerts(items, state.get("acked", {}), now):
         pending[f"{it.cmid}:{level}"] = {"item": it, "title": title, "msg": None, "count": 0, "last": 0}

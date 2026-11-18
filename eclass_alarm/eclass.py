@@ -205,6 +205,15 @@ class EclassClient:
         self.sesskey = m.group(1)
         self.main_html = r.text
 
+    def logout(self) -> None:
+        if not self.sesskey:
+            return
+        try:
+            self.s.get(f"{BASE}/login/logout.php", params={"sesskey": self.sesskey}, timeout=self.timeout)
+        except Exception:
+            pass
+        self.sesskey = None
+
     def _ajax(self, method: str, args: dict) -> dict:
         r = self.s.post(
             f"{BASE}/lib/ajax/service.php",

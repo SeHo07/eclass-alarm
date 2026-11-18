@@ -151,3 +151,32 @@ def test_pause_and_resume():
     # 무기한 정지도 JSON 저장/복원 가능
     import json
     assert json.loads(json.dumps({"p": float("inf")}))["p"] == float("inf")
+
+
+def test_need_refresh():
+    from dataclasses import asdict
+    now = 1_800_000_000
+    base = {"fetched_at": now - 600}
+    assert main.need_refresh({}, now) == "캐시 없음"
+    # 마감 먼 미완료 + 완료된 임박 항목 → 로그인 안 함
+    st = dict(base, items=[asdict(_item("a", 10 * 3600, now=now)), asdict(_item("b", 3600, done=True, now=now))])
+    assert main.need_refresh(st, now) is None
+    # 미완료가 3시간 안 → 로그인
+    st["items"].append(asdict(_item("c", 2 * 3600, now=now)))
+    assert main.need_refresh(st, now) == "마감 임박"
+    # 오래된 캐시 → 정기 확인
+    assert main.need_refresh({"fetched_at": now - 4 * 3600, "items": []}, now) == "정기 확인"
+    assert main.need_refresh({"fetched_at": now, "items": [], "force_refresh": True}, now) == "요청"
+
+
+def test_run_check_skips_login(monkeypatch):
+    from dataclasses import asdict
+    called = []
+    monkeypatch.setattr(main, "collect", lambda st, tg: called.append(1) or [])
+    now = main.time.time()
+    st = {"fetched_at": now, "items": [asdict(_item("a", 10 * 3600, now=int(now)))]}
+    main.run_check(FakeTG([]), st)
+    assert not called
+    st["items"].append(asdict(_item("b", 3600, now=int(now))))
+    main.run_check(FakeTG([]), st)
+    assert called
