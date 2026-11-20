@@ -32,6 +32,7 @@ TYPE_LABEL = {
     "feedback": "설문",
     "forum": "토론",
     "ubboard": "게시판",
+    "board": "게시판과제",
 }
 
 _DT = r"(\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?)"
@@ -264,6 +265,7 @@ class EclassClient:
         self.password = password
         self.sesskey: str | None = None
         self.main_html = ""
+        self.course_html: dict[str, str] = {}
 
     def login(self) -> None:
         self.s.get(f"{BASE}/login/index.php", timeout=self.timeout)
@@ -338,6 +340,7 @@ class EclassClient:
         completion: dict[str, bool] = {}
         for cid, cname in courses.items():
             html = self.s.get(f"{BASE}/course/view.php", params={"id": cid}, timeout=self.timeout).text
+            self.course_html[cid] = html
             its, comp = parse_course_page(html, cname)
             page_items += its
             completion.update(comp)
@@ -356,3 +359,64 @@ class EclassClient:
                 break
             after = batch[-1]["id"]
         return merge(page_items, parse_action_events(events), completion)
+
+
+    # ------------------------------------------------------------ 게시판 과제
+    def scan_boards(self, bstate: dict, lookback_days: int = 60) -> list[str]:
+        """공지/자료실 새 글에서 과제 후보를 찾고, 질의응답 게시판으로 제출 여부를 갱신.
+        bstate = {"seen": [bwid...], "tasks": {key: {...}}}. 새 후보 key 목록을 반환."""
+        from . import boards as B
+
+        now = int(datetime.now(KST).timestamp())
+        cutoff = datetime.fromtimestamp(now - lookback_days * 86400, KST).strftime("%Y-%m-%d")
+        seen = set(bstate.get("seen", []))
+        tasks = bstate.setdefault("tasks", {})
+        name = B.my_name(self.main_html, self.username)
+        new: list[str] = []
+        for cid, cname in self.courses().items():
+            html = self.course_html.get(cid) or self.get("/course/view.php", id=cid)
+            bds = B.course_boards(html)
+            for bcm, _bname, kind in bds:
+                if kind != "notice":
+                    continue
+                for row in B.parse_board_list(self.get("/mod/ubboard/view.php", id=bcm)):
+                    if not row["bwid"] or row["bwid"] in seen:
+                        continue
+                    seen.add(row["bwid"])
+                    if row["date"] < cutoff:
+                        continue
+                    art = B.parse_article(self.get("/mod/ubboard/article.php", id=bcm, bwid=row["bwid"]))
+                    if not art["posted"] or not B.is_task_article(art["title"], art["body"]):
+                        continue
+                    kws = B.title_keywords(art["body"])
+                    for n, c in enumerate(B.extract_deadlines(art["body"], art["posted"])):
+                        if c["deadline"] <= now:
+                            continue
+                        key = f"b{row['bwid']}-{n}"
+                        tasks[key] = {
+                            "course": cname, "cid": cid, "name": art["title"] or row["title"],
+                            "deadline": c["deadline"], "snippet": c["snippet"], "posted": art["posted"],
+                            "keywords": kws, "status": "pending", "done": False,
+                            "url": f"{BASE}/mod/ubboard/article.php?id={bcm}&bwid={row['bwid']}",
+                        }
+                        new.append(key)
+            # 제출 확인: 이 과목에 추적 중인 게시판 과제가 있으면 질의응답에서 내 글 찾기
+            active = [t for t in tasks.values() if t["cid"] == cid and t["status"] != "ignored"
+                      and t["deadline"] > now - 7 * 86400]
+            if not active or not name:
+                continue
+            oldest = datetime.fromtimestamp(min(t["posted"] for t in active), KST).strftime("%Y-%m-%d")
+            mine: list[dict] = []
+            for bcm, _bname, kind in bds:
+                if kind != "qna":
+                    continue
+                for page in range(1, 16):
+                    rows = B.parse_board_list(self.get("/mod/ubboard/view.php", id=bcm, page=page))
+                    if not rows:
+                        break
+                    mine += [r for r in rows if r["writer"] == name]
+                    if rows[-1]["date"] and rows[-1]["date"] < oldest:
+                        break
+            B.judge_done(active, mine)
+        bstate["seen"] = sorted(seen)[-800:]
+        return new

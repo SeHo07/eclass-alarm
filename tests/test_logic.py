@@ -242,3 +242,34 @@ def test_send_long_splits():
     tg = FakeTG([])
     main.send_long(tg, "\n".join("x" * 100 for _ in range(100)), limit=1000)
     assert len(tg.sent) > 1 and all(len(m) <= 1100 for m in tg.sent)
+
+
+def test_board_task_flow():
+    now = main.time.time()
+
+    class FakeCli:
+        def collect(self):
+            return []
+
+        def scan_boards(self, bstate):
+            bstate.setdefault("tasks", {})["b1-0"] = {
+                "course": "불교와인간", "cid": "59515", "name": "중간보고서 관련 공지", "deadline": int(now + 2 * 3600),
+                "snippet": "4. 기한: 11월 22일(일) 24:00까지", "posted": int(now - 86400), "keywords": ["중간보고"],
+                "status": "pending", "done": False, "url": "https://eclass.dongguk.edu/x"}
+            return ["b1-0"]
+
+    st = {}
+    tg = FakeTG([])
+    items = main.fetch_items(FakeCli(), st, tg)
+    assert items == [] and "게시판에서 과제 발견" in tg.sent[0]
+    # 추가 버튼 → 일정에 들어가고 알림 대상이 됨
+    tg.ups = [{"update_id": 5, "callback_query": {"id": "c", "data": "badd:b1-0",
+                                                 "message": {"message_id": 1, "chat": {"id": 1}}}}]
+    main.handle_updates(tg, st, [], {})
+    assert st["boards"]["tasks"]["b1-0"]["status"] == "added"
+    assert [d["cmid"] for d in st["items"]] == ["b1-0"]
+    its = main.board_items(st)
+    assert [(i.cmid, lvl) for i, lvl, _ in main.due_alerts(its, {}, now)] == [("b1-0", 1)]
+    # 제출 확인되면 알림 없음
+    st["boards"]["tasks"]["b1-0"]["done"] = True
+    assert main.due_alerts(main.board_items(st), {}, now) == []

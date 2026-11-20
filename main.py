@@ -115,6 +115,21 @@ def handle_updates(tg: Telegram, state: dict, items: list[Item] | None, pending:
             if str(cb.get("message", {}).get("chat", {}).get("id")) != tg.chat_id:
                 continue
             data = cb.get("data", "")
+            if data.startswith(("badd:", "bign:")):
+                key = data[5:]
+                t = state.get("boards", {}).get("tasks", {}).get(key)
+                if t:
+                    added = data.startswith("badd:")
+                    t["status"] = "added" if added else "ignored"
+                    tg.answer_callback(cb["id"], "추가함" if added else "무시함")
+                    tg.edit(cb["message"]["message_id"],
+                            ("✅ 일정 추가: " if added else "❌ 무시: ") + esc(t["course"]) + " · " + esc(t["name"])
+                            + (f" ({fmt_dt(t['deadline'])})" if added else ""))
+                    if added:  # 캐시 목록에도 바로 반영
+                        cached = [d for d in state.get("items", []) if d.get("cmid") != key]
+                        cached.append(asdict(next(i for i in board_items(state) if i.cmid == key)))
+                        state["items"] = sorted(cached, key=lambda d: d["deadline"])
+                continue
             if data.startswith("ack:"):
                 key = data[4:]
                 state.setdefault("acked", {})[key] = now
@@ -182,7 +197,7 @@ def send_long(tg: Telegram, text: str, limit: int = 3800) -> None:
         tg.send(chunk)
 
 
-def hw_text(data: dict[str, list[dict]], now: float) -> str:
+def hw_text(data: dict[str, list[dict]], now: float, state: dict | None = None) -> str:
     lines = ["<b>📝 과제 현황</b> (방금 이클래스 확인)"]
     todo_total = 0
     for course, rows in data.items():
@@ -198,6 +213,18 @@ def hw_text(data: dict[str, list[dict]], now: float) -> str:
                 lines.append(f"❌ {esc(r['name'])} · {fmt_dt(due)} 마감 지남 (미제출)")
             else:
                 lines.append(f"⬜ {esc(r['name'])} · 마감 정보 없음")
+    tasks = [t for t in (state or {}).get("boards", {}).get("tasks", {}).values()
+             if t.get("status") == "added" and t["deadline"] > now - 14 * 86400]
+    if tasks:
+        lines.append("\n<b>📌 게시판 과제</b> (질의응답 게시판 제출 확인)")
+        for t in sorted(tasks, key=lambda t: t["deadline"]):
+            if t.get("done"):
+                lines.append(f"✅ {esc(t['course'])} · {esc(t['name'])}")
+            elif t["deadline"] > now:
+                todo_total += 1
+                lines.append(f"⬜ {esc(t['course'])} · {esc(t['name'])} · {fmt_dt(t['deadline'])} · {fmt_left(t['deadline'], now)} 남음")
+            else:
+                lines.append(f"❌ {esc(t['course'])} · {esc(t['name'])} · 마감 지남 (제출 글 못 찾음)")
     lines.append(f"\n마감 전 미제출 <b>{todo_total}개</b>")
     return "\n".join(lines)
 
@@ -232,12 +259,10 @@ def process_requests(tg: Telegram, state: dict) -> None:
     cli = None
     try:
         cli = EclassClient(os.environ["ECLASS_ID"], os.environ["ECLASS_PW"])
-        items = cli.collect()
-        state["items"] = [asdict(i) for i in items]
-        state["fetched_at"] = time.time()
+        items = fetch_items(cli, state, tg)
         now = time.time()
         if "hw" in reqs:
-            send_long(tg, hw_text(cli.assignments(), now))
+            send_long(tg, hw_text(cli.assignments(), now, state))
         if "att" in reqs:
             send_long(tg, att_text(cli.attendance(), items, now))
     except Exception as e:
@@ -274,9 +299,7 @@ def collect(state: dict, tg: Telegram) -> list[Item] | None:
     cli = None
     try:
         cli = EclassClient(os.environ["ECLASS_ID"], os.environ["ECLASS_PW"])
-        items = cli.collect()
-        state["items"] = [asdict(i) for i in items]
-        state["fetched_at"] = time.time()
+        items = fetch_items(cli, state, tg)
         state.pop("force_refresh", None)
         return items
     except Exception as e:  # 로그인 실패 등은 6시간에 한 번만 알림
@@ -290,6 +313,41 @@ def collect(state: dict, tg: Telegram) -> list[Item] | None:
     finally:
         if cli:
             cli.logout()  # 세션을 남겨두지 않는다
+
+
+def board_items(state: dict) -> list[Item]:
+    out = []
+    for key, t in state.get("boards", {}).get("tasks", {}).items():
+        if t.get("status") == "added":
+            out.append(Item(cmid=key, course=t["course"], type="board", name=t["name"],
+                            deadline=t["deadline"], done=bool(t.get("done")), url=t["url"]))
+    return out
+
+
+def propose_text(t: dict) -> str:
+    return (f"<b>🔎 게시판에서 과제 발견</b>\n"
+            f"📚 {esc(t['course'])}\n"
+            f"📝 {esc(t['name'])}\n"
+            f"🕐 {fmt_dt(t['deadline'])} 마감\n"
+            f"💬 …{esc(t['snippet'])}\n"
+            f"<a href=\"{esc(t['url'])}\">공지 보기</a>\n"
+            f"일정에 추가하면 마감 알림이 오고, 질의응답 게시판에 네 글이 올라오면 제출로 처리돼.")
+
+
+def fetch_items(cli: EclassClient, state: dict, tg: Telegram) -> list[Item]:
+    """과제/동영상 + 게시판 과제 수집 → 캐시 저장. 새 게시판 과제 후보는 확인 버튼과 함께 전송."""
+    items = cli.collect()
+    bstate = state.setdefault("boards", {})
+    try:
+        for key in cli.scan_boards(bstate):
+            t = bstate["tasks"][key]
+            tg.send(propose_text(t), buttons=[[("✅ 일정 추가", f"badd:{key}"), ("❌ 무시", f"bign:{key}")]])
+    except Exception as e:  # 게시판 쪽 오류가 기본 알림을 막지 않게
+        print(f"board scan error: {type(e).__name__}: {e}", file=sys.stderr)
+    items = sorted(items + board_items(state), key=lambda i: i.deadline)
+    state["items"] = [asdict(i) for i in items]
+    state["fetched_at"] = time.time()
+    return items
 
 
 def cached_items(state: dict) -> list[Item] | None:
