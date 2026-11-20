@@ -143,6 +143,12 @@ def handle_updates(tg: Telegram, state: dict, items: list[Item] | None, pending:
         elif text in ("/resume", "재개"):
             state.pop("paused_until", None)
             tg.send("▶️ 마감 알림 다시 켬")
+        elif text in ("/hw", "/homework", "과제"):
+            if "hw" not in state.setdefault("requests", []):
+                state["requests"].append("hw")
+        elif text in ("/att", "/attendance", "출석"):
+            if "att" not in state.setdefault("requests", []):
+                state["requests"].append("att")
         elif text in ("/refresh", "새로고침"):
             state["force_refresh"] = True
             if items is None:
@@ -159,9 +165,87 @@ def handle_updates(tg: Telegram, state: dict, items: list[Item] | None, pending:
                     "• 마감 3시간·1시간 전에 [확인] 누를 때까지 반복 알림\n"
                     "• /list 미완료 목록 · /week 이번 주 일정\n"
                     "• '확인'이라고 보내면 울리는 알림 전부 정지\n"
+                    "• /hw 과제 현황 (이클래스 직접 확인) · /att 동영상 출석 현황\n"
                     "• /refresh 지금 바로 이클래스 다시 확인\n"
                     "• /pause 3h · /pause 2d · /pause (무기한) 일시정지, /resume 재개\n"
                     "(10분마다 확인해서 답장이 최대 10분 늦을 수 있어)")
+
+
+def send_long(tg: Telegram, text: str, limit: int = 3800) -> None:
+    chunk = ""
+    for line in text.split("\n"):
+        if len(chunk) + len(line) + 1 > limit:
+            tg.send(chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        tg.send(chunk)
+
+
+def hw_text(data: dict[str, list[dict]], now: float) -> str:
+    lines = ["<b>📝 과제 현황</b> (방금 이클래스 확인)"]
+    todo_total = 0
+    for course, rows in data.items():
+        done = [r for r in rows if r.get("submitted")]
+        todo = [r for r in rows if not r.get("submitted")]
+        lines.append(f"\n<b>📚 {esc(course)}</b> · 제출 {len(done)}/{len(rows)}")
+        for r in sorted(todo, key=lambda r: r.get("due") or 0):
+            due = r.get("due")
+            if due and due > now:
+                todo_total += 1
+                lines.append(f"⬜ {esc(r['name'])} · {fmt_dt(due)} · {fmt_left(due, now)} 남음")
+            elif due:
+                lines.append(f"❌ {esc(r['name'])} · {fmt_dt(due)} 마감 지남 (미제출)")
+            else:
+                lines.append(f"⬜ {esc(r['name'])} · 마감 정보 없음")
+    lines.append(f"\n마감 전 미제출 <b>{todo_total}개</b>")
+    return "\n".join(lines)
+
+
+def att_text(data: dict[str, list[dict]], items: list[Item] | None, now: float) -> str:
+    vod_deadline = {(i.course, i.name): i for i in (items or []) if i.type == "vod"}
+    lines = ["<b>🎬 동영상 출석 현황</b> (방금 이클래스 확인)", "O 출석 · ▲ 지각 · X 결석 · ⬜ 아직"]
+    for course, rows in data.items():
+        cnt = {k: sum(1 for r in rows if r["status"] == k) for k in ("O", "▲", "X")}
+        left = [r for r in rows if r["status"] not in ("O", "▲", "X")]
+        lines.append(f"\n<b>📚 {esc(course)}</b> · O {cnt['O']} · ▲ {cnt['▲']} · X {cnt['X']} · 남음 {len(left)}")
+        for r in rows:
+            if r["status"] in ("▲", "X"):
+                lines.append(f"{r['status']} {esc(r['name'])} ({esc(r['learned'])}/{esc(r['required'])})")
+        for r in left:
+            it = vod_deadline.get((course, r["name"]))
+            if it and it.deadline < now - 30 * 86400:
+                continue
+            when = ""
+            if it:
+                when = f" · {fmt_dt(it.deadline)}까지" if it.deadline > now else (
+                    f" · 지각 {fmt_dt(it.late_deadline)}까지" if it.late_deadline and it.late_deadline > now else "")
+            lines.append(f"⬜ {esc(r['name'])} ({esc(r['learned'] or '-')}/{esc(r['required'])}){when}")
+    return "\n".join(lines)
+
+
+def process_requests(tg: Telegram, state: dict) -> None:
+    """/hw /att: 로그인해서 바로 확인 (한 번 로그인으로 처리 후 로그아웃)"""
+    reqs = state.pop("requests", [])
+    if not reqs:
+        return
+    cli = None
+    try:
+        cli = EclassClient(os.environ["ECLASS_ID"], os.environ["ECLASS_PW"])
+        items = cli.collect()
+        state["items"] = [asdict(i) for i in items]
+        state["fetched_at"] = time.time()
+        now = time.time()
+        if "hw" in reqs:
+            send_long(tg, hw_text(cli.assignments(), now))
+        if "att" in reqs:
+            send_long(tg, att_text(cli.attendance(), items, now))
+    except Exception as e:
+        print(f"request error: {type(e).__name__}: {e}", file=sys.stderr)
+        tg.send(f"⚠️ 이클래스 확인 실패: {esc(str(e))[:200]}")
+    finally:
+        if cli:
+            cli.logout()
 
 
 def parse_pause(text: str, now: float) -> float:
@@ -246,6 +330,7 @@ def due_alerts(items: list[Item], acked: dict, now: float) -> list[tuple[Item, i
 def run_check(tg: Telegram, state: dict) -> None:
     pending: dict[str, dict] = {}
     handle_updates(tg, state, cached_items(state), pending)  # 명령어는 로그인 없이 캐시로 응답
+    process_requests(tg, state)
     start = now = time.time()
     if is_paused(state, now) and not state.get("force_refresh"):
         print("paused")
@@ -281,6 +366,7 @@ def run_check(tg: Telegram, state: dict) -> None:
                                    buttons=[[("✅ 확인 (알림 끄기)", f"ack:{key}")]])
                 p["last"] = now
         handle_updates(tg, state, items, pending, wait=10)
+        process_requests(tg, state)
         save_state(state)
 
 
@@ -302,6 +388,8 @@ def run_test(tg: Telegram, state: dict) -> None:
     todo = [i for i in items if not i.done and i.deadline > now]
     tg.send(f"✅ 이클래스 로그인 성공\n수집 {len(items)}개 · 마감 전 미완료 {len(todo)}개")
     tg.send(list_text(items, now, days=14, title="<b>📅 앞으로 14일 일정 (테스트)</b>"))
+    state["requests"] = ["hw", "att"]
+    process_requests(tg, state)
     tg.send("🔔 반복 알림 테스트: 아래 버튼 누르면 끝",
             buttons=[[("✅ 확인 (알림 끄기)", "ack:test")]])
     handle_updates(tg, state, items, {}, wait=0)

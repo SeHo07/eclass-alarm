@@ -180,3 +180,65 @@ def test_run_check_skips_login(monkeypatch):
     st["items"].append(asdict(_item("b", 3600, now=int(now))))
     main.run_check(FakeTG([]), st)
     assert called
+
+
+ATT = """<table class="table table-bordered user_progress_table"><thead><tr><th></th><th>강의 자료</th><th>출석인정 요구시간</th><th>총 학습시간</th><th>출석</th><th>주차 출석</th></tr></thead><tbody>
+<tr><td class="text-center" rowspan="2">9주차</td><td class="text-center">1차시</td><td class="text-left">9주차 1차시 강의1</td><td class="text-center hidden-xs">50:00</td><td class="text-center">55:38<br>1회 열람</td><td class="text-center">▲</td><td class="text-center" rowspan="2">▲</td></tr>
+<tr><td class="text-center">2차시</td><td class="text-left">9주차 2차시 강의1</td><td class="text-center hidden-xs">01:00:00</td><td class="text-center">01:06:591회 열람</td><td class="text-center">O</td></tr>
+<tr><td class="text-center">13주차</td><td class="text-center">1차시</td><td class="text-left">13주차 1차시 강의1</td><td class="text-center hidden-xs">45:00</td><td class="text-center">-</td><td class="text-center"></td><td class="text-center"></td></tr>
+</tbody></table>"""
+
+ASSIGN_VIEW = """<table class="generaltable submissionstatustable"><tbody>
+<tr><td class="cell c0">제출 여부</td><td class="submissionstatussubmitted cell c1 lastcol">제출 완료</td></tr>
+<tr><td class="cell c0">종료 일시</td><td class="cell c1 lastcol">2026-11-18 23:59</td></tr>
+<tr><td class="cell c0">마감까지 남은 기한</td><td class="latesubmission cell c1 lastcol">과제 제출이 42 분 47 초 늦었습니다.</td></tr></tbody></table>"""
+
+ASSIGN_VIEW_TODO = ASSIGN_VIEW.replace("제출 완료", "제출 안 함").replace("2026-11-18", "2026-11-25").replace(
+    "과제 제출이 42 분 47 초 늦었습니다.", "6 일 22 시간")
+
+
+def test_parse_attendance():
+    from eclass_alarm.eclass import parse_attendance
+    rows = parse_attendance(ATT)
+    assert [(r["week"], r["name"], r["learned"], r["status"]) for r in rows] == [
+        ("9주차", "9주차 1차시 강의1", "55:38", "▲"),
+        ("9주차", "9주차 2차시 강의1", "01:06:59", "O"),
+        ("13주차", "13주차 1차시 강의1", "-", ""),
+    ]
+
+
+def test_parse_assign_view_and_list():
+    from eclass_alarm.eclass import parse_assign_view, parse_course_assigns
+    a = parse_assign_view(ASSIGN_VIEW)
+    assert a == {"submitted": True, "due": _parse_kst("2026-11-18 23:59"), "late": True}
+    b = parse_assign_view(ASSIGN_VIEW_TODO)
+    assert b["submitted"] is False and not b["late"]
+    lst = parse_course_assigns(f"<ul>{ASSIGN_DONE}</ul>")
+    assert lst == [{"cmid": "176179", "name": "11주차 과제", "done": True}]
+
+
+def test_reports_render_and_request_flow(monkeypatch):
+    now = _parse_kst("2026-11-20 18:00")
+    hw = main.hw_text({"공선대": [
+        {"name": "11주차 과제", "submitted": True, "due": None},
+        {"name": "12주차 과제", "submitted": False, "due": _parse_kst("2026-11-25 23:59")},
+        {"name": "9주차 과제", "submitted": False, "due": _parse_kst("2026-11-01 23:59")},
+    ]}, now)
+    assert "제출 1/3" in hw and "⬜ 12주차 과제" in hw and "❌ 9주차 과제" in hw and "미제출 <b>1개</b>" in hw
+    from eclass_alarm.eclass import parse_attendance, Item
+    vod = Item(cmid="1", course="기업가", type="vod", name="13주차 1차시 강의1",
+               deadline=_parse_kst("2026-11-30 23:59:59"), done=False, url="u")
+    att = main.att_text({"기업가": parse_attendance(ATT)}, [vod], now)
+    assert "O 1 · ▲ 1 · X 0 · 남음 1" in att and "11/30(월) 23:59까지" in att
+    # 명령어 → requests 큐
+    st = {}
+    tg = FakeTG([{"update_id": 1, "message": {"chat": {"id": 1}, "text": "/hw"}},
+                 {"update_id": 2, "message": {"chat": {"id": 1}, "text": "출석"}}])
+    main.handle_updates(tg, st, None, {})
+    assert st["requests"] == ["hw", "att"]
+
+
+def test_send_long_splits():
+    tg = FakeTG([])
+    main.send_long(tg, "\n".join("x" * 100 for _ in range(100)), limit=1000)
+    assert len(tg.sent) > 1 and all(len(m) <= 1100 for m in tg.sent)

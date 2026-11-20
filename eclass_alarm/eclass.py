@@ -143,6 +143,80 @@ def parse_course_page(html: str, course: str) -> tuple[list[Item], dict[str, boo
     return items, completion
 
 
+def parse_course_assigns(html: str) -> list[dict]:
+    """강의실 페이지의 과제 목록: cmid, 이름, 완료 여부(완료 추적이 없으면 None)"""
+    soup = BeautifulSoup(html, "html.parser")
+    out = []
+    for li in soup.select("li.activity.modtype_assign"):
+        cmid = (li.get("id") or "").replace("module-", "")
+        name_el = li.select_one(".instancename")
+        if name_el:
+            hidden = name_el.select_one(".accesshide")
+            if hidden:
+                hidden.extract()
+        name = name_el.get_text(" ", strip=True) if name_el else "과제"
+        done = None
+        if li.select_one(".autocompletion, .togglecompletion, .completionstr"):
+            icon = li.select_one('img[src*="completion-auto-y"], img[src*="completion-manual-y"], img[src*="completion-auto-pass"]')
+            cstr = li.select_one(".completionstr")
+            done = bool(icon) or (cstr is not None and "이수완료" in cstr.get_text())
+        out.append({"cmid": cmid, "name": name, "done": done})
+    return out
+
+
+def parse_assign_view(html: str) -> dict:
+    """과제 페이지 제출 상태 표: submitted(True/False/None), due(unix|None), late(bool)"""
+    soup = BeautifulSoup(html, "html.parser")
+    info = {"submitted": None, "due": None, "late": False}
+    for tr in soup.select(".submissionstatustable tr, table.generaltable tr"):
+        cells = tr.find_all(["th", "td"])
+        if len(cells) < 2:
+            continue
+        key, val = cells[0].get_text(" ", strip=True), cells[-1].get_text(" ", strip=True)
+        if key.startswith("제출 여부") or key.lower().startswith("submission status"):
+            if "제출 완료" in val or "submitted for grading" in val.lower():
+                info["submitted"] = True
+            elif "제출 안" in val or "no attempt" in val.lower() or "미제출" in val:
+                info["submitted"] = False
+        elif key.startswith("종료 일시") or key.lower().startswith("due date"):
+            m = re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", val)
+            if m:
+                info["due"] = _parse_kst(m.group(0))
+        elif key.startswith("마감까지") and "늦었습니다" in val:
+            info["late"] = True
+    return info
+
+
+def parse_attendance(html: str) -> list[dict]:
+    """동영상 출석부(user_progress_a2.php) 표 → 주차별 행"""
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.select_one("table.user_progress_table")
+    rows = []
+    if not table:
+        return rows
+    week = ""
+    for tr in table.select("tbody tr"):
+        cells = tr.find_all("td")
+        if not cells:
+            continue
+        first = cells[0].get_text(" ", strip=True)
+        if re.fullmatch(r"\d+주차", first):
+            week = first
+        name_idx = next((i for i, c in enumerate(cells) if "text-left" in (c.get("class") or [])), None)
+        if name_idx is None or name_idx + 3 >= len(cells):
+            continue
+        txt = lambda i: cells[i].get_text(" ", strip=True)
+        learned = txt(name_idx + 2)
+        rows.append({
+            "week": week,
+            "name": txt(name_idx),
+            "required": txt(name_idx + 1),
+            "learned": (re.search(r"\d{1,2}(?::\d{2}){1,2}", learned) or [learned])[0].strip(),
+            "status": txt(name_idx + 3),  # O / ▲ / X / ''(아직)
+        })
+    return rows
+
+
 def parse_action_events(events: list[dict]) -> list[Item]:
     items = []
     for e in events:
@@ -227,10 +301,39 @@ class EclassClient:
             raise RuntimeError(f"{method} 실패: {res.get('exception')}")
         return res["data"]
 
-    def collect(self) -> list[Item]:
+    def courses(self) -> dict[str, str]:
         if not self.sesskey:
             self.login()
-        courses = parse_courses(self.main_html)
+        return parse_courses(self.main_html)
+
+    def get(self, path: str, **params) -> str:
+        return self.s.get(f"{BASE}{path}", params=params, timeout=self.timeout).text
+
+    def assignments(self) -> dict[str, list[dict]]:
+        """과목별 과제 전체 + 제출 여부 + 마감 (완료 표시된 건 상세 조회 생략)"""
+        out: dict[str, list[dict]] = {}
+        for cid, cname in self.courses().items():
+            rows = []
+            for a in parse_course_assigns(self.get("/course/view.php", id=cid)):
+                if a["done"] is True:
+                    rows.append({**a, "submitted": True, "due": None, "late": False})
+                    continue
+                info = parse_assign_view(self.get("/mod/assign/view.php", id=a["cmid"]))
+                rows.append({**a, **info})
+            if rows:
+                out[cname] = rows
+        return out
+
+    def attendance(self) -> dict[str, list[dict]]:
+        out: dict[str, list[dict]] = {}
+        for cid, cname in self.courses().items():
+            rows = parse_attendance(self.get("/report/ubcompletion/user_progress_a2.php", id=cid))
+            if rows:
+                out[cname] = rows
+        return out
+
+    def collect(self) -> list[Item]:
+        courses = self.courses()
         page_items: list[Item] = []
         completion: dict[str, bool] = {}
         for cid, cname in courses.items():
